@@ -4,6 +4,13 @@
 
 set -euo pipefail
 
+# LaunchAgents are user-level — sudo is not needed and breaks UID detection.
+if [[ $EUID -eq 0 ]]; then
+  echo "ERROR: Do not run with sudo." >&2
+  echo "Run:   bash ./install.sh" >&2
+  exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RECEIVER="$SCRIPT_DIR/receiver.py"
 PYTHON="$(command -v python3)"
