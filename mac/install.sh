@@ -30,11 +30,24 @@ fi
 
 # Verify dependencies
 "$PYTHON" -c "import pyvirtualcam, PIL, numpy, requests" 2>/dev/null || {
-  echo "Installing Python dependencies…"
+  echo "Installing Python dependencies..."
   "$PYTHON" -m pip install pyvirtualcam pillow numpy requests --quiet
 }
 
 mkdir -p "$(dirname "$LOG")"
+
+# Fix root-owned artifacts left by a previous accidental sudo run.
+# Must happen before we try to write the plist.
+AGENTS_DIR="$(dirname "$PLIST")"
+mkdir -p "$AGENTS_DIR" 2>/dev/null || true
+if [[ ! -w "$AGENTS_DIR" ]]; then
+  echo "Fixing root-owned LaunchAgents directory (requires sudo once)..."
+  sudo chown "$USER" "$AGENTS_DIR"
+fi
+if [[ -f "$PLIST" && ! -w "$PLIST" ]]; then
+  echo "Removing root-owned plist (requires sudo once)..."
+  sudo rm -f "$PLIST"
+fi
 
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -66,12 +79,6 @@ cat > "$PLIST" <<EOF
 </plist>
 EOF
 
-# Remove any existing plist (may be root-owned from a previous accidental sudo run)
-if [[ -f "$PLIST" && ! -w "$PLIST" ]]; then
-  echo "Removing root-owned plist (requires sudo once)…"
-  sudo rm -f "$PLIST"
-fi
-
 # Unload previous version if running
 launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$UID" "$PLIST"
@@ -80,7 +87,7 @@ echo ""
 echo "pwebcam receiver installed."
 echo ""
 echo "  Starts automatically at login."
-echo "  Logs → $LOG"
+echo "  Logs -> $LOG"
 echo ""
 echo "  Stop:      launchctl stop $LABEL"
 echo "  Start:     launchctl start $LABEL"
