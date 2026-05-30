@@ -66,6 +66,12 @@ cat > "$PLIST" <<EOF
 </plist>
 EOF
 
+# Remove any existing plist (may be root-owned from a previous accidental sudo run)
+if [[ -f "$PLIST" && ! -w "$PLIST" ]]; then
+  echo "Removing root-owned plist (requires sudo once)…"
+  sudo rm -f "$PLIST"
+fi
+
 # Unload previous version if running
 launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$UID" "$PLIST"
