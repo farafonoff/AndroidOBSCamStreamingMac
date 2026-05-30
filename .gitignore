@@ -1,0 +1,23 @@
+# Android
+.gradle/
+build/
+*.apk
+*.aab
+*.keystore
+local.properties
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# macOS
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Logs
+*.log
