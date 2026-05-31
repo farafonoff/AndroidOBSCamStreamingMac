@@ -24,6 +24,7 @@ import io
 import logging
 import queue
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -34,12 +35,30 @@ import pyvirtualcam
 import requests
 from PIL import Image
 
-PORT          = 8080
+PHONE_PORT    = 8080              # MJPEG server port on the phone (fixed, localhost only)
+PHONE_PACKAGE = "com.pwebcam"
+PHONE_SERVICE = "com.pwebcam/.CameraService"
 WIDTH, HEIGHT = 1280, 720
 FPS           = 30
 # Seconds to wait after the last "remove client" before declaring camera closed.
 # Handles apps that briefly disconnect/reconnect (e.g. switching camera sources).
 CLOSE_DEBOUNCE = 2.0
+
+
+def _find_free_port(start: int = 32000) -> int:
+    """Return the first free TCP port on localhost at or above *start*."""
+    for port in range(start, 65536):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    raise RuntimeError(f"No free port found above {start}")
+
+
+# Chosen once at startup; stays constant for the process lifetime.
+LOCAL_PORT = _find_free_port()
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)-8s %(message)s",
@@ -57,18 +76,52 @@ _BLACK       = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
 
 # ── ADB ──────────────────────────────────────────────────────────────────────
 
+def ensure_phone_app() -> None:
+    """Start CameraService on the phone if it is not already running."""
+    try:
+        r = subprocess.run(
+            ["adb", "shell", "dumpsys", "activity", "services", PHONE_PACKAGE],
+            capture_output=True, text=True, timeout=5,
+        )
+        if "(nothing)" not in r.stdout and PHONE_PACKAGE in r.stdout:
+            return  # already running
+    except Exception:
+        return
+
+    log.info("Starting pwebcam app on phone…")
+    try:
+        r = subprocess.run(
+            ["adb", "shell", "am", "start-foreground-service", "-n", PHONE_SERVICE],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode != 0:
+            # Fallback for older Android: launch the activity instead
+            subprocess.run(
+                ["adb", "shell", "am", "start", "-n", f"{PHONE_PACKAGE}/.MainActivity"],
+                capture_output=True, timeout=5,
+            )
+    except Exception as e:
+        log.debug("ensure_phone_app: %s", e)
+
+
 def adb_forward() -> bool:
+    """Return True only when a device is present AND the forward was set up.
+
+    Maps LOCAL_PORT on the Mac to PHONE_PORT on the phone over USB.
+    LOCAL_PORT is chosen dynamically at startup to avoid conflicts with
+    other services; PHONE_PORT is fixed (phone localhost, not exposed).
+    """
     try:
         out = subprocess.run(
             ["adb", "devices"], capture_output=True, text=True, timeout=5
         ).stdout
         if "\tdevice" not in out:
             return False
-        subprocess.run(
-            ["adb", "forward", f"tcp:{PORT}", f"tcp:{PORT}"],
+        r = subprocess.run(
+            ["adb", "forward", f"tcp:{LOCAL_PORT}", f"tcp:{PHONE_PORT}"],
             capture_output=True, timeout=5,
         )
-        return True
+        return r.returncode == 0
     except Exception:
         return False
 
@@ -207,55 +260,88 @@ def camera_monitor() -> None:
 # ── Phone streaming ───────────────────────────────────────────────────────────
 
 def phone_stream(cam: pyvirtualcam.Camera) -> None:
-    """Connect to phone and push real frames until _camera_open is cleared."""
+    """
+    Keep the phone stream alive for as long as _camera_open is set.
+    Handles USB disconnects and reconnects internally — the main loop
+    only needs to call this once per camera-open event.
+    """
     log.info("Camera opened — connecting to phone...")
+    ever_streamed  = False
+    adb_logged     = False  # avoid spamming "waiting for ADB" every frame
 
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        if not _camera_open.is_set() or not _running.is_set():
-            log.info("Camera closed before phone connected — staying idle")
-            return
-        if adb_forward():
-            break
-        log.info("Waiting for phone via USB...")
-        time.sleep(2)
-    else:
-        log.warning("Phone not found after 30 s — reverting to black frame")
-        return
+    while _camera_open.is_set() and _running.is_set():
+        # ── Wait for phone / ADB ─────────────────────────────────────────
+        if not adb_forward():
+            if not adb_logged:
+                log.info("Waiting for phone via USB (adb forward %d→%d)…",
+                         LOCAL_PORT, PHONE_PORT)
+                adb_logged = True
+            cam.send(_BLACK)
+            cam.sleep_until_next_frame()
+            continue  # try again next frame (~33 ms)
 
-    url  = f"http://127.0.0.1:{PORT}/"
-    fq: queue.Queue = queue.Queue(maxsize=1)
-    done = threading.Event()
-    t    = threading.Thread(target=_reader, args=(url, fq, done), daemon=True)
-    t.start()
-    log.info("Streaming from phone")
+        adb_logged = False  # reset so next disconnect logs again
+        ensure_phone_app()
 
-    try:
-        while _camera_open.is_set() and _running.is_set() and not done.is_set():
+        # ── Single connection attempt ─────────────────────────────────────
+        url  = f"http://127.0.0.1:{LOCAL_PORT}/"
+        fq: queue.Queue = queue.Queue(maxsize=1)
+        done = threading.Event()
+        t    = threading.Thread(target=_reader, args=(url, fq, done), daemon=True)
+        t.start()
+
+        streamed_this_session = False
+        session_start = time.monotonic()
+
+        try:
+            while _camera_open.is_set() and _running.is_set() and not done.is_set():
+                try:
+                    jpeg = fq.get(timeout=0.5)
+                except queue.Empty:
+                    cam.send(_BLACK)
+                    cam.sleep_until_next_frame()
+                    continue
+
+                if not streamed_this_session:
+                    log.info("Streaming from phone")
+                    streamed_this_session = True
+                    ever_streamed = True
+
+                try:
+                    frame = Image.open(io.BytesIO(jpeg)).convert("RGB")
+                    if frame.size != (WIDTH, HEIGHT):
+                        frame = frame.resize((WIDTH, HEIGHT), Image.BILINEAR)
+                    cam.send(np.asarray(frame))
+                    cam.sleep_until_next_frame()
+                except Exception as e:
+                    log.debug("frame decode: %s", e)
+        finally:
+            done.set()
+            t.join(timeout=5)
             try:
-                jpeg = fq.get(timeout=0.5)
+                while True:
+                    fq.get_nowait()
             except queue.Empty:
+                pass
+
+        if not _camera_open.is_set() or not _running.is_set():
+            break  # clean exit
+
+        elapsed = time.monotonic() - session_start
+        if streamed_this_session:
+            log.info("Phone disconnected — reconnecting...")
+        else:
+            # Connection attempt failed before any frame arrived.
+            # The phone may need a moment after USB reconnect — back off briefly.
+            log.info("Phone not responding on port %d (%.1f s) — retrying…",
+                     PHONE_PORT, elapsed)
+            retry_deadline = time.monotonic() + 1.0
+            while time.monotonic() < retry_deadline:
                 cam.send(_BLACK)
                 cam.sleep_until_next_frame()
-                continue
-            try:
-                frame = Image.open(io.BytesIO(jpeg)).convert("RGB")
-                if frame.size != (WIDTH, HEIGHT):
-                    frame = frame.resize((WIDTH, HEIGHT), Image.BILINEAR)
-                cam.send(np.asarray(frame))
-                cam.sleep_until_next_frame()
-            except Exception as e:
-                log.debug("frame: %s", e)
-    finally:
-        done.set()
-        t.join(timeout=5)
-        try:
-            while True:
-                fq.get_nowait()
-        except queue.Empty:
-            pass
 
-    log.info("Phone stream stopped")
+    if ever_streamed:
+        log.info("Phone stream stopped")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -269,7 +355,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
-    log.info("pwebcam receiver starting (port %d)", PORT)
+    log.info("pwebcam receiver starting (local port %d → phone port %d)", LOCAL_PORT, PHONE_PORT)
 
     threading.Thread(target=camera_monitor, daemon=True, name="cam-monitor").start()
 
@@ -282,10 +368,11 @@ def main() -> None:
 
             while _running.is_set():
                 if _camera_open.is_set():
-                    phone_stream(cam)
+                    phone_stream(cam)   # blocks until camera closes or shutdown
                 else:
                     cam.send(_BLACK)
                     cam.sleep_until_next_frame()
+                    # Yield to camera monitor thread so it can set _camera_open
 
     except Exception as e:
         log.error("Virtual camera error: %s", e)
