@@ -35,9 +35,19 @@ import pyvirtualcam
 import requests
 from PIL import Image
 
-PHONE_PORT    = 8080              # MJPEG server port on the phone (fixed, localhost only)
-PHONE_PACKAGE = "com.pwebcam"
-PHONE_SERVICE = "com.pwebcam/.CameraService"
+# ── Camera selection ─────────────────────────────────────────────────────────
+# Set PREFER_CAMERA2 = True  → connect to Camera2 port (hardware JPEG, less heat)
+#     PREFER_CAMERA2 = False → connect to Camera1 port (software JPEG, wider compat)
+# Switching takes effect after daemon restart (bash mac/restart.sh).
+PREFER_CAMERA2  = False
+
+# Camera settings (EV, focus) are stored on the phone and controlled via the
+# app UI. The receiver connects with a plain URL — no params needed.  # Camera2 JPEG continuous streaming is throttled on LIMITED HALs (e.g. Kirin 659)
+
+PHONE_PORT_CAM1 = 8080
+PHONE_PORT_CAM2 = 8081
+PHONE_PACKAGE   = "com.pwebcam"
+PHONE_SERVICE   = "com.pwebcam/.CameraService"
 WIDTH, HEIGHT = 1280, 720
 FPS           = 30
 # Seconds to wait after the last "remove client" before declaring camera closed.
@@ -57,8 +67,12 @@ def _find_free_port(start: int = 32000) -> int:
     raise RuntimeError(f"No free port found above {start}")
 
 
-# Chosen once at startup; stays constant for the process lifetime.
-LOCAL_PORT = _find_free_port()
+# Local ports chosen once at startup (above 32000, no conflicts with common services).
+_LOCAL_PORT_CAM1 = _find_free_port(32000)
+_LOCAL_PORT_CAM2 = _find_free_port(_LOCAL_PORT_CAM1 + 1)
+
+LOCAL_PORT = _LOCAL_PORT_CAM2 if PREFER_CAMERA2 else _LOCAL_PORT_CAM1
+PHONE_PORT = PHONE_PORT_CAM2  if PREFER_CAMERA2 else PHONE_PORT_CAM1
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)-8s %(message)s",
@@ -105,23 +119,24 @@ def ensure_phone_app() -> None:
 
 
 def adb_forward() -> bool:
-    """Return True only when a device is present AND the forward was set up.
-
-    Maps LOCAL_PORT on the Mac to PHONE_PORT on the phone over USB.
-    LOCAL_PORT is chosen dynamically at startup to avoid conflicts with
-    other services; PHONE_PORT is fixed (phone localhost, not exposed).
-    """
+    """Return True when a device is present and the active port forward is set up."""
     try:
         out = subprocess.run(
             ["adb", "devices"], capture_output=True, text=True, timeout=5
         ).stdout
         if "\tdevice" not in out:
             return False
-        r = subprocess.run(
-            ["adb", "forward", f"tcp:{LOCAL_PORT}", f"tcp:{PHONE_PORT}"],
-            capture_output=True, timeout=5,
-        )
-        return r.returncode == 0
+        # Forward both ports so switching camera only requires restarting the daemon.
+        # We only check the return code of the active port — the other is best-effort.
+        results = {}
+        for local, phone in [(_LOCAL_PORT_CAM1, PHONE_PORT_CAM1),
+                              (_LOCAL_PORT_CAM2, PHONE_PORT_CAM2)]:
+            r = subprocess.run(
+                ["adb", "forward", f"tcp:{local}", f"tcp:{phone}"],
+                capture_output=True, timeout=5,
+            )
+            results[phone] = r.returncode == 0
+        return results[PHONE_PORT]
     except Exception:
         return False
 
@@ -355,7 +370,9 @@ def main() -> None:
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
-    log.info("pwebcam receiver starting (local port %d → phone port %d)", LOCAL_PORT, PHONE_PORT)
+    cam_label = "Camera2 (hardware JPEG)" if PREFER_CAMERA2 else "Camera1 (software JPEG)"
+    log.info("pwebcam receiver starting — %s  (local %d → phone %d)",
+             cam_label, LOCAL_PORT, PHONE_PORT)
 
     threading.Thread(target=camera_monitor, daemon=True, name="cam-monitor").start()
 

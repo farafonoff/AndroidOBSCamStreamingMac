@@ -11,7 +11,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
-class MjpegServer(private val port: Int = 8080) {
+class MjpegServer(val port: Int = 8080) {
 
     interface ClientListener {
         fun onFirstClientConnected()
@@ -19,6 +19,9 @@ class MjpegServer(private val port: Int = 8080) {
     }
 
     var clientListener: ClientListener? = null
+
+    /** Called whenever a client connects, with query params parsed from the request URL. */
+    var onSettings: ((Map<String, String>) -> Unit)? = null
 
     private var serverSocket: ServerSocket? = null
     private val clients = CopyOnWriteArrayList<ClientWriter>()
@@ -46,7 +49,14 @@ class MjpegServer(private val port: Int = 8080) {
         while (!ss.isClosed) {
             try {
                 val socket = ss.accept()
-                val writer = ClientWriter(socket)
+                // One BufferedReader for the entire request — passed to ClientWriter so it
+                // continues draining headers from the same buffer (no double-read bug).
+                val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+                val firstLine = reader.readLine() ?: ""
+                val params = parseQueryParams(firstLine)
+                if (params.isNotEmpty()) onSettings?.invoke(params)
+
+                val writer = ClientWriter(socket, reader)
                 clients.add(writer)
                 if (activeCount.getAndIncrement() == 0) {
                     clientListener?.onFirstClientConnected()
@@ -73,7 +83,27 @@ class MjpegServer(private val port: Int = 8080) {
         }
     }
 
-    inner class ClientWriter(private val socket: Socket) : Runnable {
+    /** Parse `?key=value&key2=value2` from a raw HTTP request line. */
+    private fun parseQueryParams(requestLine: String): Map<String, String> {
+        val qStart = requestLine.indexOf('?')
+        val qEnd   = requestLine.lastIndexOf(' ')
+        if (qStart == -1 || qEnd <= qStart) return emptyMap()
+        return requestLine.substring(qStart + 1, qEnd)
+            .split('&')
+            .mapNotNull { pair ->
+                val (k, v) = pair.split('=', limit = 2).let {
+                    if (it.size == 2) it[0] to it[1] else return@mapNotNull null
+                }
+                k to v
+            }.toMap()
+    }
+
+    inner class ClientWriter(
+        private val socket: Socket,
+        /** Shared reader from acceptLoop — already past the first request line. */
+        private val reader: BufferedReader,
+    ) : Runnable {
+
         private val queue = ArrayBlockingQueue<ByteArray>(2)
         @Volatile private var alive = true
 
@@ -86,7 +116,7 @@ class MjpegServer(private val port: Int = 8080) {
 
         override fun run() {
             try {
-                val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+                // Drain remaining HTTP headers (first line already consumed in acceptLoop)
                 while (reader.readLine()?.isNotEmpty() == true) {}
 
                 val out = socket.getOutputStream()
