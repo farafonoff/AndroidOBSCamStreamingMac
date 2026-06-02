@@ -30,7 +30,7 @@ class CameraService : Service() {
             svc.lastEv = (svc.lastEv + delta).coerceIn(-3, 3)
             svc.saveSettings()
             svc.cameraExecutor.execute {
-                (svc.activeSource as? Camera1Source)?.configure(svc.lastEv, svc.lastFocus)
+                svc.activeSource?.configure(svc.lastEv, svc.lastFocus)
             }
             if (svc.activeSource != null) svc.updateNotification(svc.streamingText())
         }
@@ -42,12 +42,59 @@ class CameraService : Service() {
             svc.lastFocus = alias
             svc.saveSettings()
             svc.cameraExecutor.execute {
-                (svc.activeSource as? Camera1Source)?.configure(svc.lastEv, svc.lastFocus)
+                svc.activeSource?.configure(svc.lastEv, svc.lastFocus)
             }
             if (svc.activeSource != null) svc.updateNotification(svc.streamingText())
         }
 
         fun currentFocus(): String = instance?.lastFocus ?: "picture"
+
+        fun setFlash(enabled: Boolean) {
+            val svc = instance ?: return
+            svc.lastFlash = enabled
+            svc.saveSettings()
+            val brightness = svc.lastFlashBrightness
+            svc.cameraExecutor.execute {
+                svc.activeSource?.setFlash(enabled, brightness)
+            }
+            if (svc.activeSource != null) svc.updateNotification(svc.streamingText())
+        }
+
+        fun setFlashBrightness(brightness: Int) {
+            val svc = instance ?: return
+            svc.lastFlashBrightness = brightness
+            svc.saveSettings()
+            val enabled = svc.lastFlash
+            svc.cameraExecutor.execute {
+                svc.activeSource?.setFlash(enabled, brightness)
+            }
+        }
+
+        fun currentFlash(): Boolean = instance?.lastFlash ?: false
+        fun currentFlashBrightness(): Int = instance?.lastFlashBrightness ?: 1
+        fun maxFlashBrightness(): Int = instance?.activeSource?.maxFlashBrightness() ?: 1
+        fun supportsFlashBrightness(): Boolean = instance?.activeSource?.supportsFlashBrightness() ?: false
+
+        fun setCam2HardwareJpeg(enabled: Boolean) {
+            val svc = instance ?: return
+            svc.lastCam2HardwareJpeg = enabled
+            svc.saveSettings()
+            // Restart Camera2 source with new setting if currently active
+            svc.cameraExecutor.execute {
+                if (svc.activeSource is Camera2Source) {
+                    svc.activeSource?.stop()
+                    svc.activeSource = try {
+                        Camera2Source(
+                            svc, svc.lastFlash, svc.lastFlashBrightness, enabled
+                        ).also { it.start { frame -> svc.server2.pushFrame(frame) } }
+                    } catch (e: Exception) { e.printStackTrace(); null }
+                }
+            }
+        }
+
+        fun currentCam2HardwareJpeg(): Boolean = instance?.lastCam2HardwareJpeg ?: true
+        fun isCamera2Active(): Boolean = instance?.activeSource is Camera2Source
+        fun activeApiName(): String = instance?.activeSource?.apiName() ?: "—"
     }
 
     private val server1 = MjpegServer(PORT_CAMERA1)
@@ -61,16 +108,28 @@ class CameraService : Service() {
     // Camera settings — persisted in SharedPreferences, owned by the phone.
     @Volatile private var lastEv: Int = 0
     @Volatile private var lastFocus: String = "picture"
+    @Volatile private var lastFlash: Boolean = false
+    @Volatile private var lastFlashBrightness: Int = 1
+    @Volatile private var lastCam2HardwareJpeg: Boolean = true
 
     private val prefs by lazy { getSharedPreferences("pwebcam", Context.MODE_PRIVATE) }
 
     private fun loadSettings() {
-        lastEv    = prefs.getInt("ev", 0)
-        lastFocus = prefs.getString("focus", "picture") ?: "picture"
+        lastEv             = prefs.getInt("ev", 0)
+        lastFocus          = prefs.getString("focus", "picture") ?: "picture"
+        lastFlash            = prefs.getBoolean("flash", false)
+        lastFlashBrightness  = prefs.getInt("flash_brightness", 1)
+        lastCam2HardwareJpeg = prefs.getBoolean("cam2_hw_jpeg", true)
     }
 
     private fun saveSettings() {
-        prefs.edit().putInt("ev", lastEv).putString("focus", lastFocus).apply()
+        prefs.edit()
+            .putInt("ev", lastEv)
+            .putString("focus", lastFocus)
+            .putBoolean("flash", lastFlash)
+            .putInt("flash_brightness", lastFlashBrightness)
+            .putBoolean("cam2_hw_jpeg", lastCam2HardwareJpeg)
+            .apply()
     }
 
     override fun onCreate() {
@@ -90,8 +149,8 @@ class CameraService : Service() {
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification("Waiting for connection…"))
 
-        wireServer(server1) { Camera1Source(ev = lastEv, focusAlias = lastFocus) }
-        wireServer(server2) { Camera2Source(this) }
+        wireServer(server1) { Camera1Source(ev = lastEv, focusAlias = lastFocus, flashEnabled = lastFlash) }
+        wireServer(server2) { Camera2Source(this, lastFlash, lastFlashBrightness, lastCam2HardwareJpeg, lastEv, lastFocus) }
         try { server1.start() } catch (e: Exception) { e.printStackTrace() }
         try { server2.start() } catch (e: Exception) { e.printStackTrace() }
         return START_STICKY
@@ -108,9 +167,8 @@ class CameraService : Service() {
         server.onSettings = { params ->
             params["ev"]?.toIntOrNull()?.also { lastEv = it }
             params["focus"]?.also { lastFocus = it }
-            // Apply to running camera immediately (if already active)
             cameraExecutor.execute {
-                (activeSource as? Camera1Source)?.configure(lastEv, lastFocus)
+                activeSource?.configure(lastEv, lastFocus)
             }
         }
         server.clientListener = object : MjpegServer.ClientListener {
@@ -160,7 +218,8 @@ class CameraService : Service() {
 
     private fun streamingText(): String {
         val ev = if (lastEv >= 0) "+$lastEv" else "$lastEv"
-        return "Streaming · EV $ev · focus: $lastFocus"
+        val flash = if (lastFlash) " · flash on" else ""
+        return "Streaming · EV $ev · focus: $lastFocus$flash"
     }
 
     private fun buildNotification(text: String): Notification {

@@ -20,13 +20,13 @@ Key technical decisions made during development, with rationale.
 
 ---
 
-## 3. Camera1 API over Camera2
+## 3. Camera1 API over Camera2 (primary device)
 
-**Decision:** Use the deprecated `android.hardware.Camera` (Camera1) API.
+**Decision:** Use the deprecated `android.hardware.Camera` (Camera1) API as the default.
 
-**Why:** Target device is a Huawei FIG-LX1 (P Smart 2017, Kirin 659). Its Camera2 `INFO_SUPPORTED_HARDWARE_LEVEL` is `LIMITED`. Testing confirmed that Camera2 JPEG output via `setRepeatingRequest` is throttled well below 30 fps on this HAL — jerkier and higher latency than Camera1 + software JPEG. Camera1 runs smoothly at 30 fps.
+**Why:** Target device is a Huawei FIG-LX1 (P Smart 2017, Kirin 659, API 28). Its Camera2 `INFO_SUPPORTED_HARDWARE_LEVEL` is `LIMITED`. Testing confirmed that Camera2 JPEG output via `setRepeatingRequest` is throttled well below 30 fps on this HAL — jerkier and higher latency than Camera1 + software JPEG. Camera1 runs smoothly at 30 fps.
 
-Camera2 support is kept in the codebase (`Camera2Source`, port 8081) and can be enabled via `PREFER_CAMERA2 = True` in `receiver.py` for devices with FULL hardware level.
+Camera2 support is kept in the codebase (`Camera2Source`, port 8081) and can be enabled via `PREFER_CAMERA2 = True` in `receiver.py` for devices with FULL hardware level (e.g. Pixel).
 
 ---
 
@@ -42,9 +42,9 @@ The replacement gives each client its own writer thread and an `ArrayBlockingQue
 
 ## 5. Dynamic local port above 32000
 
-**Decision:** The Mac-side port for `adb forward` is chosen dynamically at startup above 32000 (`_find_free_port(32000)`). The phone-side port stays fixed at 8080.
+**Decision:** The Mac-side port for `adb forward` is chosen dynamically at startup above 32000 (`_find_free_port(32000)`). The phone-side ports stay fixed (8080 Camera1, 8081 Camera2).
 
-**Why:** Port 8080 is commonly used by local dev servers, causing `adb forward` to fail silently. Ports above 32000 are rarely in use. The phone's port 8080 is safe because it is only accessible via ADB (phone's localhost) — no Mac-side conflict is possible.
+**Why:** Port 8080 is commonly used by local dev servers, causing `adb forward` to fail silently. Ports above 32000 are rarely in use. The phone-side ports are safe because they are only accessible via ADB (phone's localhost).
 
 ---
 
@@ -93,9 +93,9 @@ The replacement gives each client its own writer thread and an `ArrayBlockingQue
 
 ## 11. Camera settings stored on the phone (SharedPreferences)
 
-**Decision:** EV compensation and focus mode are stored in `SharedPreferences` on the phone and controlled via the app UI. The receiver connects with a plain URL — no query params.
+**Decision:** EV compensation, focus mode, flash, and flash brightness are stored in `SharedPreferences` on the phone and controlled via the app UI. The receiver connects with a plain URL — no query params.
 
-**Why:** The phone is the entity that actually uses these settings and the user tunes them by looking at the camera output. Storing them in `receiver.py` would require editing a file and restarting a daemon on the Mac every time. SharedPreferences persist across app restarts and phone reboots, making the settings truly "set and forget". The receiver is correctly reduced to a pure transport layer.
+**Why:** The phone is the entity that actually uses these settings and the user tunes them by looking at the camera output. SharedPreferences persist across app restarts and phone reboots, making the settings truly "set and forget". The receiver is correctly reduced to a pure transport layer.
 
 ---
 
@@ -104,3 +104,27 @@ The replacement gives each client its own writer thread and an `ArrayBlockingQue
 **Decision:** `CameraService` runs two `MjpegServer` instances — Camera1 on port 8080, Camera2 on port 8081. The receiver connects to one port based on `PREFER_CAMERA2`.
 
 **Why:** Allows switching camera API without modifying the Android app — just change `PREFER_CAMERA2` and restart the Mac daemon. Only one camera source is active at a time (enforced by a shared `cameraExecutor`). The unused server stays in `acceptLoop()` with negligible overhead.
+
+---
+
+## 13. CameraSource interface for polymorphic camera control
+
+**Decision:** `Camera1Source` and `Camera2Source` implement a common `CameraSource` interface with `start()`, `stop()`, `configure(ev, focus)`, `setFlash()`, `apiName()`, and flash brightness query methods.
+
+**Why:** Allows `CameraService` to call `configure()`, `setFlash()`, etc. without knowing which API is active — no casting required. Adding a third source (e.g. Camera2 on a new device) requires no changes to `CameraService` or the UI.
+
+---
+
+## 14. Camera2 EV and focus via CaptureRequest
+
+**Decision:** Camera2Source applies EV via `CONTROL_AE_EXPOSURE_COMPENSATION` and focus via `CONTROL_AF_MODE_*` in every repeating request, clamping EV to the device-reported `CONTROL_AE_COMPENSATION_RANGE`.
+
+**Why:** Camera2 has no mutable `Parameters` object like Camera1. Settings must be baked into each `CaptureRequest`. Re-calling `setRepeatingRequest()` with updated values is the correct Camera2 pattern and takes effect within one frame.
+
+---
+
+## 15. Flash torch brightness via raw Camera2 string keys (API 33+)
+
+**Decision:** `FLASH_TORCH_STRENGTH_MAX_LEVEL` and `FLASH_STRENGTH_LEVEL` are accessed via raw string key names (`CameraCharacteristics.Key` / `CaptureRequest.Key` with the AOSP tag string) rather than the named constants.
+
+**Why:** The named constants were added in API 33 and cause "Unresolved reference" compile errors on some Android Studio / SDK setups even with a `Build.VERSION.SDK_INT >= 33` guard. Raw string keys are available at any compile SDK level and are identical at runtime on API 33+ devices. The feature is invisible on older devices regardless.

@@ -1,7 +1,11 @@
 package com.pwebcam
 
 interface CameraSource {
-    /** Start capturing. [onFrame] is called on an arbitrary thread for every JPEG frame. */
     fun start(onFrame: (ByteArray) -> Unit)
     fun stop()
+    fun configure(ev: Int, focusAlias: String) {}
+    fun setFlash(enabled: Boolean, brightness: Int = 1) {}
+    fun supportsFlashBrightness(): Boolean = false
+    fun maxFlashBrightness(): Int = 1
+    fun apiName(): String = "Unknown"
 }

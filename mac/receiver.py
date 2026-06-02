@@ -36,10 +36,12 @@ import requests
 from PIL import Image
 
 # ── Camera selection ─────────────────────────────────────────────────────────
-# Set PREFER_CAMERA2 = True  → connect to Camera2 port (hardware JPEG, less heat)
-#     PREFER_CAMERA2 = False → connect to Camera1 port (software JPEG, wider compat)
-# Switching takes effect after daemon restart (bash mac/restart.sh).
-PREFER_CAMERA2  = False
+# PREFER_CAMERA2 = True  → port 8081 (Camera2 API; hardware/software JPEG toggled in-app)
+# PREFER_CAMERA2 = False → port 8080 (Camera1 API; software JPEG, most compatible)
+# Change takes effect after: bash mac/restart.sh
+# Note: Camera2 is throttled on LIMITED HALs (e.g. Kirin 659 / Huawei FIG-LX1).
+#       Use True only on devices with FULL Camera2 support (e.g. Pixel).
+PREFER_CAMERA2  = True
 
 # Camera settings (EV, focus) are stored on the phone and controlled via the
 # app UI. The receiver connects with a plain URL — no params needed.  # Camera2 JPEG continuous streaming is throttled on LIMITED HALs (e.g. Kirin 659)
@@ -370,7 +372,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
-    cam_label = "Camera2 (hardware JPEG)" if PREFER_CAMERA2 else "Camera1 (software JPEG)"
+    cam_label = "Camera2 (hw/sw JPEG toggled in-app)" if PREFER_CAMERA2 else "Camera1 (software JPEG)"
     log.info("pwebcam receiver starting — %s  (local %d → phone %d)",
              cam_label, LOCAL_PORT, PHONE_PORT)
 
