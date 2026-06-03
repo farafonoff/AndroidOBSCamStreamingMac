@@ -29,22 +29,71 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 import pyvirtualcam
 import requests
 from PIL import Image
 
-# ── Camera selection ─────────────────────────────────────────────────────────
+
+# ── Config (.env) ─────────────────────────────────────────────────────────────
+# Optional mac/.env file — see mac/.env.example for all keys.
+
+def _load_env() -> dict:
+    env_path = Path(__file__).parent / ".env"
+    cfg: dict = {}
+    if not env_path.exists():
+        return cfg
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            k, _, v = line.partition("=")
+            cfg[k.strip()] = v.strip()
+    return cfg
+
+_cfg = _load_env()
+
+# ── ADB device targeting ───────────────────────────────────────────────────────
+# With multiple ADB devices (USB phone + TCP TV box etc.) plain `adb` commands
+# fail with "error: more than one device/emulator".  Set DEVICE or CONNECTION
+# in mac/.env to pin the receiver to one device.
+#
+# ADB_DEVICE_ARGS is prepended to every adb invocation:
+#   DEVICE=<serial>      → ["-s", "<serial>"]   most explicit
+#   CONNECTION=usb       → ["-d"]               any single USB device
+#   CONNECTION=tcpip     → ["-e"]               any single TCP/IP device
+#   (nothing set)        → []                   works only when exactly one device
+
+_DEVICE     = _cfg.get("DEVICE", "").strip()
+_CONNECTION = _cfg.get("CONNECTION", "").strip().lower()
+
+if _DEVICE:
+    ADB_DEVICE_ARGS: list = ["-s", _DEVICE]
+elif _CONNECTION == "usb":
+    ADB_DEVICE_ARGS = ["-d"]
+elif _CONNECTION == "tcpip":
+    ADB_DEVICE_ARGS = ["-e"]
+else:
+    ADB_DEVICE_ARGS = []
+
+# ── Camera selection ──────────────────────────────────────────────────────────
 # PREFER_CAMERA2 = True  → port 8081 (Camera2 API; hardware/software JPEG toggled in-app)
 # PREFER_CAMERA2 = False → port 8080 (Camera1 API; software JPEG, most compatible)
-# Change takes effect after: bash mac/restart.sh
 # Note: Camera2 is throttled on LIMITED HALs (e.g. Kirin 659 / Huawei FIG-LX1).
 #       Use True only on devices with FULL Camera2 support (e.g. Pixel).
-PREFER_CAMERA2  = True
+_prefer_cam2_env = _cfg.get("PREFER_CAMERA2", "").strip().lower()
+if _prefer_cam2_env in ("true", "1", "yes"):
+    PREFER_CAMERA2 = True
+elif _prefer_cam2_env in ("false", "0", "no"):
+    PREFER_CAMERA2 = False
+else:
+    PREFER_CAMERA2 = True  # default
 
 # Camera settings (EV, focus) are stored on the phone and controlled via the
-# app UI. The receiver connects with a plain URL — no params needed.  # Camera2 JPEG continuous streaming is throttled on LIMITED HALs (e.g. Kirin 659)
+# app UI. The receiver connects with a plain URL — no params needed.
 
 PHONE_PORT_CAM1 = 8080
 PHONE_PORT_CAM2 = 8081
@@ -96,7 +145,7 @@ def ensure_phone_app() -> None:
     """Start CameraService on the phone if it is not already running."""
     try:
         r = subprocess.run(
-            ["adb", "shell", "dumpsys", "activity", "services", PHONE_PACKAGE],
+            ["adb"] + ADB_DEVICE_ARGS + ["shell", "dumpsys", "activity", "services", PHONE_PACKAGE],
             capture_output=True, text=True, timeout=5,
         )
         if "(nothing)" not in r.stdout and PHONE_PACKAGE in r.stdout:
@@ -107,13 +156,13 @@ def ensure_phone_app() -> None:
     log.info("Starting pwebcam app on phone…")
     try:
         r = subprocess.run(
-            ["adb", "shell", "am", "start-foreground-service", "-n", PHONE_SERVICE],
+            ["adb"] + ADB_DEVICE_ARGS + ["shell", "am", "start-foreground-service", "-n", PHONE_SERVICE],
             capture_output=True, text=True, timeout=5,
         )
         if r.returncode != 0:
             # Fallback for older Android: launch the activity instead
             subprocess.run(
-                ["adb", "shell", "am", "start", "-n", f"{PHONE_PACKAGE}/.MainActivity"],
+                ["adb"] + ADB_DEVICE_ARGS + ["shell", "am", "start", "-n", f"{PHONE_PACKAGE}/.MainActivity"],
                 capture_output=True, timeout=5,
             )
     except Exception as e:
@@ -121,20 +170,24 @@ def ensure_phone_app() -> None:
 
 
 def adb_forward() -> bool:
-    """Return True when a device is present and the active port forward is set up."""
+    """Return True when the target device is present and port forwards are set up."""
     try:
-        out = subprocess.run(
-            ["adb", "devices"], capture_output=True, text=True, timeout=5
-        ).stdout
-        if "\tdevice" not in out:
-            return False
+        if not ADB_DEVICE_ARGS:
+            # No specific device configured — require exactly one device to avoid
+            # "error: more than one device/emulator" on the forward commands.
+            out = subprocess.run(
+                ["adb", "devices"], capture_output=True, text=True, timeout=5
+            ).stdout
+            if "\tdevice" not in out:
+                return False
+
         # Forward both ports so switching camera only requires restarting the daemon.
         # We only check the return code of the active port — the other is best-effort.
         results = {}
         for local, phone in [(_LOCAL_PORT_CAM1, PHONE_PORT_CAM1),
                               (_LOCAL_PORT_CAM2, PHONE_PORT_CAM2)]:
             r = subprocess.run(
-                ["adb", "forward", f"tcp:{local}", f"tcp:{phone}"],
+                ["adb"] + ADB_DEVICE_ARGS + ["forward", f"tcp:{local}", f"tcp:{phone}"],
                 capture_output=True, timeout=5,
             )
             results[phone] = r.returncode == 0
@@ -373,8 +426,13 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _stop)
 
     cam_label = "Camera2 (hw/sw JPEG toggled in-app)" if PREFER_CAMERA2 else "Camera1 (software JPEG)"
+    if ADB_DEVICE_ARGS:
+        device_label = " ".join(ADB_DEVICE_ARGS)
+    else:
+        device_label = "any single device (set DEVICE= or CONNECTION= in mac/.env for multi-device setups)"
     log.info("pwebcam receiver starting — %s  (local %d → phone %d)",
              cam_label, LOCAL_PORT, PHONE_PORT)
+    log.info("ADB target: %s", device_label)
 
     threading.Thread(target=camera_monitor, daemon=True, name="cam-monitor").start()
 

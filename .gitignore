@@ -21,3 +21,6 @@ venv/
 
 # Logs
 *.log
+
+# Local config (device-specific, not committed)
+mac/.env
