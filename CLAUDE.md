@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-**pwebcam** turns an Android phone into a low-latency (~55ms) USB webcam for macOS via ADB-forwarded MJPEG over TCP. The virtual camera is injected via OBS's CMIOExtension driver (pyvirtualcam). Works with Teams, Zoom, OBS, Google Meet.
+**pwebcam** turns an Android phone into a low-latency (~55ms over USB) webcam for macOS via MJPEG over TCP, forwarded through ADB (default) or reached over Wi-Fi via mDNS discovery. The virtual camera is injected via OBS's CMIOExtension driver (pyvirtualcam). Works with Teams, Zoom, OBS, Google Meet.
 
 ## Commands
 
@@ -37,19 +37,21 @@ There are no automated tests.
 
 ### Data flow
 ```
-Android Camera → MjpegServer (TCP) → ADB forward (USB) → receiver.py → pyvirtualcam → OBS virtual cam
+Android Camera → MjpegServer (TCP) → ADB forward (USB) or LAN (mDNS) → receiver.py → pyvirtualcam → OBS virtual cam
 ```
 - Phone listens on **port 8080** (Camera1) and **8081** (Camera2) simultaneously
-- Receiver forwards a local port ≥32000 to one of those via `adb forward`
+- Receiver forwards a local port ≥32000 to one of those via `adb forward` (USB), or connects straight to the phone's LAN address (Wi-Fi)
 - Receiver streams `GET /` and parses MJPEG boundary frames
 
 ### Android components (`android/app/src/main/java/com/pwebcam/`)
 
 | File | Role |
 |------|------|
-| `CameraService.kt` | Foreground service; starts both MJPEG servers; persists settings via SharedPreferences |
-| `MjpegServer.kt` | Raw `ServerSocket`; per-client `ArrayBlockingQueue(2)` with drop-oldest; never blocks camera callback |
-| `CameraSource.kt` | Interface: `start`, `stop`, `configure(ev, focusAlias)`, `setFlash(enabled, brightness)` |
+| `CameraService.kt` | Foreground service; starts both MJPEG servers; advertises `_pwebcam._tcp`/`_http._tcp` over mDNS; holds a WifiLock; persists settings via SharedPreferences |
+| `MjpegServer.kt` | Raw `ServerSocket`; per-client `ArrayBlockingQueue(2)` with drop-oldest; never blocks camera callback; also routes `/ui` and `/api/*` to an HTTP handler |
+| `BootReceiver.kt` | Starts `CameraService` after boot when the `autostart` pref is on |
+| `assets/ui.html` | Web UI served by the phone: status, preview, controls |
+| `CameraSource.kt` | Interface: `start`, `stop`, `configure(ev, focusAlias)`, `setFlash(enabled, brightness)`, `setQuality(quality, maxFps)`; also `FramePacer` |
 | `Camera1Source.kt` | Camera1 API (default); NV21→JPEG in software; targets devices where Camera2 throttles JPEG to <30fps |
 | `Camera2Source.kt` | Camera2 API; hardware JPEG (toggleable), per-frame `CaptureRequest` for EV/focus |
 | `MainActivity.kt` | UI: start/stop, EV ±3, focus mode, flash, Camera2 HW JPEG toggle |
@@ -62,14 +64,15 @@ Camera API is chosen by **which port** the receiver connects to. Both servers ru
 - **Camera open/close detection**: streams macOS unified logs from the OBS CMIOExtension process watching for `_clientQueue_addStreamingClient` / `_clientQueue_removeStreamingClient` (2s close debounce). `AVCaptureDevice.isInUseByAnotherApplication` does not work for CMIOExtension.
 - Connects to the phone only while the virtual camera is actively used; disconnects on idle to power down the phone camera
 - Auto-starts the phone foreground service via `adb shell am start-foreground-service` on reconnect
-- `PREFER_CAMERA2 = True` at top of file controls which port (8080 vs 8081) the receiver targets
+- `PREFER_CAMERA2` (from `mac/.env`) controls which port (8080 vs 8081) the receiver targets
+- `TRANSPORT=usb|wifi|auto` and `PHONE_HOST` (from `mac/.env`) pick the transport; `resolve_url()` decides per connection attempt. Wi-Fi discovery shells out to macOS `dns-sd` (python-zeroconf did not work here)
 
 ## Key design constraints
 
 - **MJPEG, not H.264**: intra-frame only → exact 1-frame latency; no decoder jitter buffers
-- **USB/ADB, not Wi-Fi**: deterministic link, ~5ms transport vs. ~1s for Wi-Fi H.264
+- **USB/ADB first, Wi-Fi optional**: deterministic link, ~5ms transport vs. ~1s for Wi-Fi H.264; Wi-Fi MJPEG is unencrypted/unauthenticated, so trusted networks only
 - **Camera1 is the default**: LIMITED Camera2 HALs (e.g. Kirin 659) throttle JPEG output below 30fps
 - **Raw ServerSocket over NanoHTTPD**: drop-oldest queue semantics; camera callback must never block on slow clients
 - **Dynamic local port ≥32000**: avoids collisions with common dev servers; phone-side ports are fixed
 
-See `DECISIONS.md` for full rationale on all 15 architectural decisions.
+See `DECISIONS.md` for full rationale on all 20 architectural decisions.

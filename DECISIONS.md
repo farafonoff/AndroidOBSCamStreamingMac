@@ -6,7 +6,7 @@ Key technical decisions made during development, with rationale.
 
 ## 1. USB (ADB forward) over Wi-Fi
 
-**Decision:** Stream over USB via `adb forward tcp:LOCAL tcp:8080`, not Wi-Fi.
+**Decision:** Stream over USB via `adb forward tcp:LOCAL tcp:8080` as the primary transport. (Wi-Fi was later added as an optional alternative; see decision 16.)
 
 **Why:** Wi-Fi webcam apps (DroidCam, EpocCam) have ~1 s latency because H.264 requires jitter buffers for reliability. USB is a deterministic link — no jitter buffer needed. ADB forward latency is ~5 ms.
 
@@ -128,3 +128,51 @@ The replacement gives each client its own writer thread and an `ArrayBlockingQue
 **Decision:** `FLASH_TORCH_STRENGTH_MAX_LEVEL` and `FLASH_STRENGTH_LEVEL` are accessed via raw string key names (`CameraCharacteristics.Key` / `CaptureRequest.Key` with the AOSP tag string) rather than the named constants.
 
 **Why:** The named constants were added in API 33 and cause "Unresolved reference" compile errors on some Android Studio / SDK setups even with a `Build.VERSION.SDK_INT >= 33` guard. Raw string keys are available at any compile SDK level and are identical at runtime on API 33+ devices. The feature is invisible on older devices regardless.
+
+---
+
+## 16. Optional Wi-Fi transport, USB stays primary
+
+**Decision:** The receiver supports `TRANSPORT=usb|wifi|auto`. `usb` is the default. `auto` tries USB first on each connection attempt and falls back to Wi-Fi. The phone servers already listened on all interfaces, so the change is on the receiver (`resolve_url()`) plus discovery.
+
+**Why:** Decision 1 still holds for latency, but a cable isn't always practical. MJPEG over a LAN avoids the H.264 jitter-buffer problem; what remains is Wi-Fi variance, which is why quality and FPS are tunable (decision 19). Wi-Fi mode cannot auto-start the phone app (no ADB), which is what decision 20 partly addresses.
+
+**Trade-off:** The stream is unencrypted and unauthenticated. Anyone on the same network can open it, and a connection from anywhere on the LAN turns the camera on. An optional shared token is the obvious next step; it isn't implemented.
+
+---
+
+## 17. mDNS discovery with the system `dns-sd`, not python-zeroconf
+
+**Decision:** The phone registers `_pwebcam._tcp` (Camera1 port as the service port, both ports as TXT `cam1`/`cam2`) and `_http._tcp` through `NsdManager`. The receiver browses and resolves with the macOS `dns-sd` command and resolves the host name with `getaddrinfo`. `PHONE_HOST` bypasses discovery.
+
+**Why:** The pure-Python `zeroconf` package did not see the phone on the target Mac, while `dns-sd` (which talks to mDNSResponder) found it immediately. `dns-sd` ships with macOS, so there is no extra dependency and no separate multicast socket to fight with the system responder. Android's `NsdManager` cannot set a custom hostname, so the advertised host is whatever the phone calls itself (e.g. `Android.local`).
+
+---
+
+## 18. Web UI served by the phone's `MjpegServer`
+
+**Decision:** `MjpegServer` routes each request: `/ui`, `/api/*`, and `/` for a browser (`Accept: text/html`) go to an HTTP handler; everything else (`/`, `/stream`) is the MJPEG stream as before. The page is a single static file in `assets/ui.html`, and the handler is wired up in `CameraService`.
+
+**Why:** The phone already owns the settings (decision 11), the camera, and the discovery record, so serving the controls from it works over both USB and Wi-Fi with no Mac involvement. Routing on the `Accept` header leaves the receiver (`requests` sends `*/*`) untouched. Request parsing moved off the accept thread so a stalled client can't block new connections.
+
+**Caveat:** Both servers share one camera, so a preview opened on one port interrupts a stream on the other.
+
+---
+
+## 19. Live JPEG quality and frame-rate cap
+
+**Decision:** `CameraSource.setQuality(jpegQuality, maxFps)`. Camera1 and the Camera2 software path read the quality at encode time; Camera2 hardware JPEG gets it through `JPEG_QUALITY` in the repeating request. A `FramePacer` drops frames before encoding. Both values are persisted on the phone and applied without restarting the camera.
+
+**Why:** Bandwidth is the main Wi-Fi risk. A frame cap before encoding also saves phone CPU. Resolution was deliberately left out for now: changing it restarts the source and touches the receiver's fixed 1280x720 output.
+
+---
+
+## 20. Start on boot, plus Wi-Fi latency tuning
+
+**Decision:** A `BootReceiver` starts `CameraService` after boot (pref `autostart`, default on, switch in the app). While the service runs it holds a `WifiLock` (low-latency mode on Android 10+, high-performance below) and sets `TCP_NODELAY`, a 64 KB send buffer and AF41 traffic class on client sockets.
+
+**Why:** Over Wi-Fi nothing can start the app for you, and Wi-Fi power-save adds jitter on old phones. The small send buffer keeps stale frames from queuing in the kernel behind our own drop-oldest queue. The AF41 marking is cheap and harmless but may be ignored by the phone or AP.
+
+**Limits:** On Android 11+ camera-type foreground services generally can't start from the background, so a boot start can be refused; `onStartCommand` catches this and stops the service instead of crashing. The latency settings are unmeasured.
+
+**Known issue:** On this Kirin 659 phone, switching sources between the two ports while Camera2 is delivering frames crashed `Camera2Source.imageYuvToJpeg` (`buffer is inaccessible`). It is not fixed; the listener has no try/catch.
