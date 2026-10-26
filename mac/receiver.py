@@ -23,6 +23,7 @@ These are the ground-truth signals emitted by CoreMediaIO itself.
 import io
 import logging
 import queue
+import re
 import signal
 import socket
 import subprocess
@@ -92,6 +93,14 @@ elif _prefer_cam2_env in ("false", "0", "no"):
 else:
     PREFER_CAMERA2 = True  # default
 
+# ── Transport ─────────────────────────────────────────────────────────────────
+# usb (default) | wifi | auto  — see mac/.env.example
+TRANSPORT = _cfg.get("TRANSPORT", "usb").strip().lower()
+if TRANSPORT not in ("usb", "wifi", "auto"):
+    TRANSPORT = "usb"
+PHONE_HOST = _cfg.get("PHONE_HOST", "").strip()
+MDNS_TYPE  = "_pwebcam._tcp"
+
 # Camera settings (EV, focus) are stored on the phone and controlled via the
 # app UI. The receiver connects with a plain URL — no params needed.
 
@@ -104,6 +113,10 @@ FPS           = 30
 # Seconds to wait after the last "remove client" before declaring camera closed.
 # Handles apps that briefly disconnect/reconnect (e.g. switching camera sources).
 CLOSE_DEBOUNCE = 2.0
+# Seconds between black keep-alive frames while no app has the camera open.
+IDLE_KEEPALIVE = 1.0
+# Seconds between adb probes while the camera is open but the phone is absent.
+ADB_RETRY_INTERVAL = 5.0
 
 
 def _find_free_port(start: int = 32000) -> int:
@@ -194,6 +207,104 @@ def adb_forward() -> bool:
         return results[PHONE_PORT]
     except Exception:
         return False
+
+
+# ── Wi-Fi discovery (mDNS) ────────────────────────────────────────────────────
+# Uses macOS's built-in `dns-sd` (talks to mDNSResponder) — no extra dependency.
+# The pure-Python zeroconf package did not see the phone on this setup.
+
+_found: dict = {}   # service name -> (host, cam1_port, cam2_port)
+_found_lock = threading.Lock()
+
+
+def _resolve_instance(name: str) -> None:
+    """Resolve one advertised instance with `dns-sd -L` and record its address and ports."""
+    proc = subprocess.Popen(
+        ["dns-sd", "-L", name, MDNS_TYPE, "local."],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
+    )
+    host = None
+    port = 0
+    txt: dict = {}
+    deadline = time.monotonic() + 5
+    try:
+        for line in proc.stdout:
+            m = re.search(r"can be reached at (\S+?):(\d+)", line)
+            if m:
+                host, port = m.group(1), int(m.group(2))
+                continue
+            if host and "=" in line:
+                txt = dict(t.split("=", 1) for t in line.split() if "=" in t)
+                break
+            if time.monotonic() > deadline:
+                break
+    finally:
+        proc.terminate()
+    if not host:
+        return
+    try:
+        addr = socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
+    except OSError:
+        return
+    with _found_lock:
+        if name not in _found:
+            log.info("Discovered phone %s at %s", name, addr)
+        _found[name] = (addr, int(txt.get("cam1") or port), int(txt.get("cam2") or PHONE_PORT_CAM2))
+
+
+def _discovery_loop() -> None:
+    """Follow `dns-sd -B` (the system mDNSResponder) and keep _found up to date."""
+    while _running.is_set():
+        try:
+            proc = subprocess.Popen(
+                ["dns-sd", "-B", MDNS_TYPE, "local."],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
+            )
+        except FileNotFoundError:
+            log.error("'dns-sd' not found — Wi-Fi discovery disabled (set PHONE_HOST instead)")
+            return
+        for line in proc.stdout:
+            parts = line.split(None, 6)
+            if len(parts) < 7 or parts[1] not in ("Add", "Rmv"):
+                continue
+            name = parts[6].strip()
+            if parts[1] == "Add":
+                threading.Thread(target=_resolve_instance, args=(name,), daemon=True).start()
+            else:
+                with _found_lock:
+                    _found.pop(name, None)
+        proc.terminate()
+        time.sleep(2)
+
+
+def start_discovery() -> None:
+    threading.Thread(target=_discovery_loop, daemon=True, name="mdns").start()
+    log.info("Wi-Fi discovery active (%s)", MDNS_TYPE)
+
+
+def wifi_url() -> str | None:
+    """URL of the phone on the LAN, from PHONE_HOST or mDNS; None if not found."""
+    if PHONE_HOST:
+        return f"http://{PHONE_HOST}:{PHONE_PORT}/"
+    with _found_lock:
+        if not _found:
+            return None
+        host, cam1, cam2 = next(iter(_found.values()))
+    return f"http://{host}:{cam2 if PREFER_CAMERA2 else cam1}/"
+
+
+def resolve_url() -> str | None:
+    """
+    Pick a transport and return the stream URL, or None if the phone is unreachable.
+    USB goes through adb forward (and auto-starts the phone service); Wi-Fi needs
+    the phone app already running.
+    """
+    if TRANSPORT in ("usb", "auto") and adb_forward():
+        ensure_phone_app()
+        return f"http://127.0.0.1:{LOCAL_PORT}/"
+    if TRANSPORT in ("wifi", "auto"):
+        return wifi_url()
+    return None
 
 
 # ── MJPEG parser ─────────────────────────────────────────────────────────────
@@ -339,22 +450,28 @@ def phone_stream(cam: pyvirtualcam.Camera) -> None:
     ever_streamed  = False
     adb_logged     = False  # avoid spamming "waiting for ADB" every frame
 
+    next_adb_check = 0.0  # monotonic time of the next allowed adb probe
+
     while _camera_open.is_set() and _running.is_set():
         # ── Wait for phone / ADB ─────────────────────────────────────────
-        if not adb_forward():
-            if not adb_logged:
-                log.info("Waiting for phone via USB (adb forward %d→%d)…",
-                         LOCAL_PORT, PHONE_PORT)
-                adb_logged = True
+        # Keep feeding black frames to the consumer at full rate, but probe adb
+        # (3 subprocesses) only every ADB_RETRY_INTERVAL seconds.
+        url = None
+        if time.monotonic() >= next_adb_check:
+            url = resolve_url()
+            if url is None:
+                next_adb_check = time.monotonic() + ADB_RETRY_INTERVAL
+                if not adb_logged:
+                    log.info("Waiting for phone (%s)…", TRANSPORT)
+                    adb_logged = True
+        if url is None:
             cam.send(_BLACK)
             cam.sleep_until_next_frame()
-            continue  # try again next frame (~33 ms)
+            continue
 
         adb_logged = False  # reset so next disconnect logs again
-        ensure_phone_app()
 
         # ── Single connection attempt ─────────────────────────────────────
-        url  = f"http://127.0.0.1:{LOCAL_PORT}/"
         fq: queue.Queue = queue.Queue(maxsize=1)
         done = threading.Event()
         t    = threading.Thread(target=_reader, args=(url, fq, done), daemon=True)
@@ -403,8 +520,7 @@ def phone_stream(cam: pyvirtualcam.Camera) -> None:
         else:
             # Connection attempt failed before any frame arrived.
             # The phone may need a moment after USB reconnect — back off briefly.
-            log.info("Phone not responding on port %d (%.1f s) — retrying…",
-                     PHONE_PORT, elapsed)
+            log.info("Phone not responding at %s (%.1f s) — retrying…", url, elapsed)
             retry_deadline = time.monotonic() + 1.0
             while time.monotonic() < retry_deadline:
                 cam.send(_BLACK)
@@ -432,7 +548,9 @@ def main() -> None:
         device_label = "any single device (set DEVICE= or CONNECTION= in mac/.env for multi-device setups)"
     log.info("pwebcam receiver starting — %s  (local %d → phone %d)",
              cam_label, LOCAL_PORT, PHONE_PORT)
-    log.info("ADB target: %s", device_label)
+    log.info("Transport: %s · ADB target: %s", TRANSPORT, device_label)
+    if TRANSPORT in ("wifi", "auto") and not PHONE_HOST:
+        start_discovery()
 
     threading.Thread(target=camera_monitor, daemon=True, name="cam-monitor").start()
 
@@ -447,9 +565,11 @@ def main() -> None:
                 if _camera_open.is_set():
                     phone_stream(cam)   # blocks until camera closes or shutdown
                 else:
+                    # Idle: no consumer, so don't burn CPU pushing 30 fps of black.
+                    # Block until the camera opens (wakes instantly), with a slow
+                    # keep-alive frame so the virtual camera stays alive.
                     cam.send(_BLACK)
-                    cam.sleep_until_next_frame()
-                    # Yield to camera monitor thread so it can set _camera_open
+                    _camera_open.wait(IDLE_KEEPALIVE)
 
     except Exception as e:
         log.error("Virtual camera error: %s", e)

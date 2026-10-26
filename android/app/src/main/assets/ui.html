@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pwebcam</title>
+<style>
+  :root { --bg:#111; --card:#1c1c1e; --fg:#eee; --dim:#8a8a8e; --accent:#4da3ff; --ok:#3ecf6e; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg);
+         font:15px/1.4 -apple-system, system-ui, sans-serif; max-width:720px; margin-inline:auto; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  .sub { color:var(--dim); margin-bottom:16px; }
+  .card { background:var(--card); border-radius:12px; padding:14px; margin-bottom:12px; }
+  .row { display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; }
+  .row + .row { margin-top:12px; }
+  .chip { display:inline-block; padding:2px 10px; border-radius:99px; background:#2c2c2e; color:var(--dim); }
+  .chip.on { background:var(--ok); color:#06210f; }
+  button { background:#2c2c2e; color:var(--fg); border:0; border-radius:8px; padding:8px 14px; font:inherit; }
+  button.sel { background:var(--accent); color:#001a33; font-weight:600; }
+  button:active { opacity:.7; }
+  .seg { display:flex; gap:6px; flex-wrap:wrap; }
+  #preview { width:100%; border-radius:8px; background:#000; display:none; aspect-ratio:16/9; object-fit:contain; }
+  .note { color:var(--dim); font-size:13px; margin-top:8px; }
+  input[type=range] { width:100%; }
+  a { color:var(--accent); }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<h1>pwebcam</h1>
+<div class="sub"><span id="model">…</span> · <span id="thisApi"></span></div>
+
+<div class="card">
+  <div class="row">
+    <span><span id="state" class="chip">idle</span> <span id="stats" class="note"></span></span>
+    <button id="previewBtn">Start preview</button>
+  </div>
+  <img id="preview" alt="preview">
+  <div class="note">Preview turns the phone camera on. If the Mac is streaming from the other
+    camera API, opening it here will interrupt that stream.</div>
+</div>
+
+<div class="card">
+  <div class="row"><span>Bandwidth</span><span><b id="mbit">0.0</b> Mbit/s</span></div>
+  <div class="row"><span class="seg" id="presets">
+    <button data-q="55" data-f="24">Wi-Fi 2.4 GHz</button>
+    <button data-q="70" data-f="30">Balanced</button>
+    <button data-q="85" data-f="30">High</button>
+  </span></div>
+  <div class="row"><span>JPEG quality <b id="qv"></b></span></div>
+  <div class="row"><input id="quality" type="range" min="30" max="95" step="5"></div>
+  <div class="row"><span>Max FPS <b id="fv"></b></span></div>
+  <div class="row"><input id="maxFps" type="range" min="5" max="30" step="1"></div>
+  <div class="note">Applies live. Lower quality and FPS cut bandwidth; the FPS cap also saves phone CPU.</div>
+</div>
+
+<div class="card">
+  <div class="row"><span>Exposure (EV)</span>
+    <span><button data-ev="-1">−</button> <b id="ev" style="display:inline-block;min-width:3ch;text-align:center">0</b> <button data-ev="1">+</button></span>
+  </div>
+  <div class="row"><span>Focus</span>
+    <span class="seg" id="focus">
+      <button data-focus="picture">Picture</button><button data-focus="video">Video</button>
+      <button data-focus="fixed">Fixed</button><button data-focus="infinity">Infinity</button>
+    </span>
+  </div>
+  <div class="row"><span>Flash</span><button id="flash">Off</button></div>
+  <div class="row" id="flashBrightnessRow" hidden>
+    <input id="flashBrightness" type="range" min="1" max="1" step="1">
+  </div>
+  <div class="row" id="hwRow" hidden><span>Hardware JPEG</span><button id="hwJpeg">On</button></div>
+</div>
+
+<div class="card note">
+  Other camera API: <a id="other" href="#">…</a>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let st = null, last = null, fps = 0, mbit = 0;
+
+async function call(path) {
+  try { const r = await fetch(path, {cache:'no-store'}); st = await r.json(); render(); } catch (e) {}
+}
+const set = q => call('/api/set?' + q);
+
+function render() {
+  $('model').textContent = st.model;
+  $('thisApi').textContent = st.thisApi + ' · port ' + location.port;
+  const on = st.streaming;
+  $('state').textContent = on ? 'streaming' : 'idle';
+  $('state').classList.toggle('on', on);
+  $('stats').textContent = on ? `${st.activeApi} · ${fps.toFixed(0)} fps · ${st.clients} client(s)` : '';
+  $('mbit').textContent = mbit.toFixed(1);
+  const qEl = $('quality'), fEl = $('maxFps');
+  if (document.activeElement !== qEl) qEl.value = st.quality;
+  if (document.activeElement !== fEl) fEl.value = st.maxFps;
+  $('qv').textContent = st.quality;
+  $('fv').textContent = st.maxFps;
+  document.querySelectorAll('[data-q]').forEach(b =>
+    b.classList.toggle('sel', +b.dataset.q === st.quality && +b.dataset.f === st.maxFps));
+  $('ev').textContent = (st.ev > 0 ? '+' : '') + st.ev;
+  document.querySelectorAll('[data-focus]').forEach(b => b.classList.toggle('sel', b.dataset.focus === st.focus));
+  $('flash').textContent = st.flash ? 'On' : 'Off';
+  $('flash').classList.toggle('sel', st.flash);
+  const fb = $('flashBrightness');
+  $('flashBrightnessRow').hidden = !(st.supportsFlashBrightness && st.flash);
+  fb.max = st.maxFlashBrightness;
+  if (document.activeElement !== fb) fb.value = st.flashBrightness;
+  $('hwRow').hidden = st.thisApi !== 'Camera2';
+  $('hwJpeg').textContent = st.hwJpeg ? 'On' : 'Off';
+  $('hwJpeg').classList.toggle('sel', st.hwJpeg);
+  const o = $('other');
+  o.href = `http://${location.hostname}:${st.otherPort}/ui`;
+  o.textContent = `${st.thisApi === 'Camera2' ? 'Camera1' : 'Camera2'} (port ${st.otherPort})`;
+}
+
+document.querySelectorAll('[data-ev]').forEach(b => b.onclick = () => set('evDelta=' + b.dataset.ev));
+document.querySelectorAll('[data-focus]').forEach(b => b.onclick = () => set('focus=' + b.dataset.focus));
+$('flash').onclick = () => set('flash=' + (st.flash ? 0 : 1));
+$('hwJpeg').onclick = () => set('hwJpeg=' + (st.hwJpeg ? 0 : 1));
+document.querySelectorAll('[data-q]').forEach(b =>
+  b.onclick = () => set(`quality=${b.dataset.q}&maxFps=${b.dataset.f}`));
+$('quality').oninput = e => { $('qv').textContent = e.target.value; };
+$('maxFps').oninput = e => { $('fv').textContent = e.target.value; };
+$('quality').onchange = e => set('quality=' + e.target.value);
+$('maxFps').onchange = e => set('maxFps=' + e.target.value);
+$('flashBrightness').onchange = e => set('flashBrightness=' + e.target.value);
+
+let previewing = false;
+$('previewBtn').onclick = () => {
+  previewing = !previewing;
+  const img = $('preview');
+  img.style.display = previewing ? 'block' : 'none';
+  img.src = previewing ? '/stream?t=' + Date.now() : '';
+  $('previewBtn').textContent = previewing ? 'Stop preview' : 'Start preview';
+};
+addEventListener('pagehide', () => { $('preview').src = ''; });
+
+setInterval(async () => {
+  const prev = st;
+  await call('/api/state');
+  const now = Date.now();
+  if (prev && last && st.frames >= prev.frames) {
+    fps = (st.frames - prev.frames) * 1000 / (now - last);
+    mbit = (st.bytes - prev.bytes) * 8 / 1000 / (now - last);   // bytes/ms*8/1000 = Mbit/s
+  }
+  last = now;
+  render();
+}, 1000);
+call('/api/state');
+</script>
+</body>
+</html>

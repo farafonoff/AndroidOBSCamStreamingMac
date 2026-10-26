@@ -7,9 +7,13 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import org.json.JSONObject
 import java.util.concurrent.Executors
 
 class CameraService : Service() {
@@ -20,6 +24,15 @@ class CameraService : Service() {
         const val PORT_CAMERA2 = 8081
         private const val CHANNEL_ID = "pwebcam_channel"
         private const val NOTIFICATION_ID = 1
+
+        /** Start on boot; on by default. Read straight from prefs — the service may not be running. */
+        fun autostartEnabled(ctx: Context): Boolean =
+            ctx.getSharedPreferences("pwebcam", Context.MODE_PRIVATE).getBoolean("autostart", true)
+
+        fun setAutostart(ctx: Context, enabled: Boolean) {
+            ctx.getSharedPreferences("pwebcam", Context.MODE_PRIVATE)
+                .edit().putBoolean("autostart", enabled).apply()
+        }
 
         @Volatile var isRunning = false
         @Volatile private var instance: CameraService? = null
@@ -86,10 +99,24 @@ class CameraService : Service() {
                     svc.activeSource = try {
                         Camera2Source(
                             svc, svc.lastFlash, svc.lastFlashBrightness, enabled
-                        ).also { it.start { frame -> svc.server2.pushFrame(frame) } }
+                        ).also {
+                            it.setQuality(svc.lastQuality, svc.lastMaxFps)
+                            it.start { frame -> svc.server2.pushFrame(frame) }
+                        }
                     } catch (e: Exception) { e.printStackTrace(); null }
                 }
             }
+        }
+
+        /** Live JPEG quality (10-100) and frame-rate cap (1-30); both persisted on the phone. */
+        fun setQuality(quality: Int, maxFps: Int) {
+            val svc = instance ?: return
+            svc.lastQuality = quality.coerceIn(10, 100)
+            svc.lastMaxFps = maxFps.coerceIn(1, 30)
+            svc.saveSettings()
+            val q = svc.lastQuality
+            val f = svc.lastMaxFps
+            svc.cameraExecutor.execute { svc.activeSource?.setQuality(q, f) }
         }
 
         fun currentCam2HardwareJpeg(): Boolean = instance?.lastCam2HardwareJpeg ?: true
@@ -111,6 +138,14 @@ class CameraService : Service() {
     @Volatile private var lastFlash: Boolean = false
     @Volatile private var lastFlashBrightness: Int = 1
     @Volatile private var lastCam2HardwareJpeg: Boolean = true
+    @Volatile private var lastQuality: Int = 80
+    @Volatile private var lastMaxFps: Int = 30
+
+    // mDNS/DNS-SD advertisement so the Mac receiver can find the phone over Wi-Fi.
+    // Keeps the Wi-Fi radio out of power-save while serving; saves latency/jitter on old phones.
+    private var wifiLock: WifiManager.WifiLock? = null
+
+    private val nsdListeners = mutableListOf<NsdManager.RegistrationListener>()
 
     private val prefs by lazy { getSharedPreferences("pwebcam", Context.MODE_PRIVATE) }
 
@@ -120,6 +155,8 @@ class CameraService : Service() {
         lastFlash            = prefs.getBoolean("flash", false)
         lastFlashBrightness  = prefs.getInt("flash_brightness", 1)
         lastCam2HardwareJpeg = prefs.getBoolean("cam2_hw_jpeg", true)
+        lastQuality          = prefs.getInt("quality", 80)
+        lastMaxFps           = prefs.getInt("max_fps", 30)
     }
 
     private fun saveSettings() {
@@ -129,6 +166,8 @@ class CameraService : Service() {
             .putBoolean("flash", lastFlash)
             .putInt("flash_brightness", lastFlashBrightness)
             .putBoolean("cam2_hw_jpeg", lastCam2HardwareJpeg)
+            .putInt("quality", lastQuality)
+            .putInt("max_fps", lastMaxFps)
             .apply()
     }
 
@@ -147,13 +186,131 @@ class CameraService : Service() {
         }
         isRunning = true
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification("Waiting for connection…"))
+        try {
+            startForeground(NOTIFICATION_ID, buildNotification("Waiting for connection…"))
+        } catch (e: Exception) {
+            // Camera-type foreground services can't start from the background on newer
+            // Android (e.g. a boot start). Bail out; the user opens the app instead.
+            e.printStackTrace()
+            isRunning = false
+            stopSelf()
+            return START_NOT_STICKY
+        }
 
+        wireHttp(server1)
+        wireHttp(server2)
         wireServer(server1) { Camera1Source(ev = lastEv, focusAlias = lastFocus, flashEnabled = lastFlash) }
         wireServer(server2) { Camera2Source(this, lastFlash, lastFlashBrightness, lastCam2HardwareJpeg, lastEv, lastFocus) }
         try { server1.start() } catch (e: Exception) { e.printStackTrace() }
         try { server2.start() } catch (e: Exception) { e.printStackTrace() }
+        registerNsd()
+        acquireWifiLock()
         return START_STICKY
+    }
+
+    /**
+     * Advertise on the LAN: `_pwebcam._tcp` (what the Mac receiver browses for; Camera1 port,
+     * Camera2 port as a TXT attribute) and `_http._tcp` (so the web UI shows up in Bonjour browsers).
+     */
+    private fun registerNsd() {
+        if (nsdListeners.isNotEmpty()) return
+        register("_pwebcam._tcp.", "pwebcam-${Build.MODEL}") {
+            setAttribute("cam1", PORT_CAMERA1.toString())
+            setAttribute("cam2", PORT_CAMERA2.toString())
+        }
+        register("_http._tcp.", "pwebcam (${Build.MODEL})") { setAttribute("path", "/ui") }
+    }
+
+    private fun register(type: String, name: String, attrs: NsdServiceInfo.() -> Unit) {
+        val info = NsdServiceInfo().apply {
+            serviceName = name
+            serviceType = type
+            port = PORT_CAMERA1
+            attrs()
+        }
+        val listener = object : NsdManager.RegistrationListener {
+            override fun onServiceRegistered(i: NsdServiceInfo) {}
+            override fun onRegistrationFailed(i: NsdServiceInfo, code: Int) { nsdListeners.remove(this) }
+            override fun onServiceUnregistered(i: NsdServiceInfo) {}
+            override fun onUnregistrationFailed(i: NsdServiceInfo, code: Int) {}
+        }
+        try {
+            getSystemService(NsdManager::class.java)
+                .registerService(info, NsdManager.PROTOCOL_DNS_SD, listener)
+            nsdListeners.add(listener)
+        } catch (e: Exception) { e.printStackTrace() }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun acquireWifiLock() {
+        if (wifiLock?.isHeld == true) return
+        try {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY else WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            wifiLock = wm.createWifiLock(mode, "pwebcam").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (e: Exception) { e.printStackTrace() }
+    }
+
+    private fun releaseWifiLock() {
+        try { wifiLock?.takeIf { it.isHeld }?.release() } catch (_: Exception) {}
+        wifiLock = null
+    }
+
+    private fun unregisterNsd() {
+        val nsd = getSystemService(NsdManager::class.java)
+        nsdListeners.toList().forEach { try { nsd.unregisterService(it) } catch (_: Exception) {} }
+        nsdListeners.clear()
+    }
+
+    // ── Web UI / JSON API ────────────────────────────────────────────────────
+
+    private fun wireHttp(server: MjpegServer) {
+        server.httpHandler = { path, params ->
+            when (path) {
+                "/ui" -> MjpegServer.HttpReply(assets.open("ui.html").readBytes(), "text/html; charset=utf-8")
+                "/api/state" -> jsonReply(server)
+                "/api/set" -> { applyWebSettings(params); jsonReply(server) }
+                else -> null
+            }
+        }
+    }
+
+    private fun applyWebSettings(p: Map<String, String>) {
+        p["evDelta"]?.toIntOrNull()?.let { adjustEv(it.coerceIn(-1, 1)) }
+        p["focus"]?.takeIf { it in setOf("picture", "video", "fixed", "infinity") }?.let { setFocus(it) }
+        p["flash"]?.let { setFlash(it == "1") }
+        p["flashBrightness"]?.toIntOrNull()?.let { setFlashBrightness(it) }
+        p["hwJpeg"]?.let { setCam2HardwareJpeg(it == "1") }
+        if ("quality" in p || "maxFps" in p) {
+            setQuality(p["quality"]?.toIntOrNull() ?: lastQuality, p["maxFps"]?.toIntOrNull() ?: lastMaxFps)
+        }
+    }
+
+    private fun jsonReply(server: MjpegServer): MjpegServer.HttpReply {
+        val src = activeSource
+        val json = JSONObject()
+            .put("model", Build.MODEL)
+            .put("thisApi", if (server === server2) "Camera2" else "Camera1")
+            .put("otherPort", if (server === server2) PORT_CAMERA1 else PORT_CAMERA2)
+            .put("activeApi", src?.apiName() ?: "—")
+            .put("streaming", src != null)
+            .put("clients", server.clientCount)
+            .put("frames", server.framesPushed.get())
+            .put("bytes", server.bytesPushed.get())
+            .put("quality", lastQuality)
+            .put("maxFps", lastMaxFps)
+            .put("ev", lastEv)
+            .put("focus", lastFocus)
+            .put("flash", lastFlash)
+            .put("flashBrightness", lastFlashBrightness)
+            .put("maxFlashBrightness", src?.maxFlashBrightness() ?: 1)
+            .put("supportsFlashBrightness", src?.supportsFlashBrightness() ?: false)
+            .put("hwJpeg", lastCam2HardwareJpeg)
+        return MjpegServer.HttpReply(json.toString().toByteArray(), "application/json")
     }
 
     /**
@@ -176,7 +333,10 @@ class CameraService : Service() {
                 cameraExecutor.execute {
                     activeSource?.stop()
                     activeSource = try {
-                        factory().also { it.start { frame -> server.pushFrame(frame) } }
+                        factory().also {
+                            it.setQuality(lastQuality, lastMaxFps)
+                            it.start { frame -> server.pushFrame(frame) }
+                        }
                     } catch (e: Exception) {
                         e.printStackTrace()
                         null
@@ -198,6 +358,8 @@ class CameraService : Service() {
     override fun onDestroy() {
         isRunning = false
         instance = null
+        unregisterNsd()
+        releaseWifiLock()
         server1.clientListener = null
         server2.clientListener = null
         server1.stop()

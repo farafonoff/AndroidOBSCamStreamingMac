@@ -198,6 +198,14 @@
 
     </LinearLayout>
 
+    <Switch
+        android:id="@+id/sw_autostart"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Start on boot"
+        android:textColor="#AAAAAA"
+        android:layout_marginTop="32dp" />
+
     <TextView
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"

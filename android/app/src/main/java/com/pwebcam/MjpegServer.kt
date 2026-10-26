@@ -10,6 +10,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 class MjpegServer(val port: Int = 8080) {
 
@@ -22,6 +23,28 @@ class MjpegServer(val port: Int = 8080) {
 
     /** Called whenever a client connects, with query params parsed from the request URL. */
     var onSettings: ((Map<String, String>) -> Unit)? = null
+
+    /** Reply for a non-stream HTTP route (web UI page, JSON API). */
+    class HttpReply(
+        val body: ByteArray,
+        val contentType: String,
+        val status: String = "200 OK",
+    )
+
+    /**
+     * Handles `/ui` and `/api/...`; return null for 404. A browser navigating to `/`
+     * (Accept: text/html) is mapped to `/ui`. Plain stream clients (the Mac receiver) are untouched.
+     */
+    var httpHandler: ((path: String, params: Map<String, String>) -> HttpReply?)? = null
+
+    /** Connected stream clients. */
+    val clientCount: Int get() = activeCount.get()
+
+    /** Total frames pushed to this server; the UI derives fps from deltas. */
+    val framesPushed = AtomicLong()
+
+    /** Total JPEG bytes produced (once per frame, not per client); the UI derives bitrate from deltas. */
+    val bytesPushed = AtomicLong()
 
     private var serverSocket: ServerSocket? = null
     private val clients = CopyOnWriteArrayList<ClientWriter>()
@@ -49,26 +72,73 @@ class MjpegServer(val port: Int = 8080) {
         while (!ss.isClosed) {
             try {
                 val socket = ss.accept()
-                // One BufferedReader for the entire request — passed to ClientWriter so it
-                // continues draining headers from the same buffer (no double-read bug).
-                val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
-                val firstLine = reader.readLine() ?: ""
-                val params = parseQueryParams(firstLine)
-                if (params.isNotEmpty()) onSettings?.invoke(params)
-
-                val writer = ClientWriter(socket, reader)
-                clients.add(writer)
-                if (activeCount.getAndIncrement() == 0) {
-                    clientListener?.onFirstClientConnected()
-                }
-                clientExecutor.execute(writer)
+                // Parse off the accept thread so a stalled client can't block new connections.
+                clientExecutor.execute { handle(socket) }
             } catch (_: Exception) {
                 break
             }
         }
     }
 
+    private fun handle(socket: Socket) {
+        var streaming = false
+        try {
+            // Latency tuning for Wi-Fi: send frames immediately, keep the kernel send buffer to
+            // about one frame so stale data can't pile up behind a stalled link (our own
+            // drop-oldest queue only protects the layer above it), and mark traffic AF41 (video).
+            try {
+                socket.tcpNoDelay = true
+                socket.sendBufferSize = 64 * 1024
+                socket.trafficClass = 0x88
+            } catch (_: Exception) {}
+            socket.soTimeout = 5000
+            val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+            val firstLine = reader.readLine() ?: return
+            val headers = HashMap<String, String>()
+            while (true) {
+                val line = reader.readLine()
+                if (line.isNullOrEmpty()) break
+                val i = line.indexOf(':')
+                if (i > 0) headers[line.substring(0, i).trim().lowercase()] = line.substring(i + 1).trim()
+            }
+            socket.soTimeout = 0
+
+            val path = firstLine.split(' ').getOrNull(1)?.substringBefore('?') ?: "/"
+            val params = parseQueryParams(firstLine)
+            val wantsPage = path == "/" && headers["accept"]?.contains("text/html") == true
+
+            if (wantsPage || path == "/ui" || path.startsWith("/api/")) {
+                val reply = httpHandler?.invoke(if (wantsPage) "/ui" else path, params)
+                    ?: HttpReply("Not found".toByteArray(), "text/plain", "404 Not Found")
+                val out = socket.getOutputStream()
+                out.write(
+                    ("HTTP/1.1 ${reply.status}\r\n" +
+                     "Content-Type: ${reply.contentType}\r\n" +
+                     "Content-Length: ${reply.body.size}\r\n" +
+                     "Cache-Control: no-store\r\n" +
+                     "Connection: close\r\n\r\n").toByteArray(Charsets.US_ASCII)
+                )
+                out.write(reply.body)
+                out.flush()
+                return
+            }
+
+            // MJPEG stream (`/` or `/stream`).
+            if (params.isNotEmpty()) onSettings?.invoke(params)
+            val writer = ClientWriter(socket)
+            clients.add(writer)
+            streaming = true
+            if (activeCount.getAndIncrement() == 0) clientListener?.onFirstClientConnected()
+            writer.run()
+        } catch (_: Exception) {
+        } finally {
+            if (!streaming) try { socket.close() } catch (_: Exception) {}
+        }
+    }
+
     fun pushFrame(jpeg: ByteArray) {
+        framesPushed.incrementAndGet()
+        bytesPushed.addAndGet(jpeg.size.toLong())
         if (clients.isEmpty()) return
         val dead = mutableListOf<ClientWriter>()
         for (client in clients) {
@@ -98,11 +168,7 @@ class MjpegServer(val port: Int = 8080) {
             }.toMap()
     }
 
-    inner class ClientWriter(
-        private val socket: Socket,
-        /** Shared reader from acceptLoop — already past the first request line. */
-        private val reader: BufferedReader,
-    ) : Runnable {
+    inner class ClientWriter(private val socket: Socket) : Runnable {
 
         private val queue = ArrayBlockingQueue<ByteArray>(2)
         @Volatile private var alive = true
@@ -116,9 +182,6 @@ class MjpegServer(val port: Int = 8080) {
 
         override fun run() {
             try {
-                // Drain remaining HTTP headers (first line already consumed in acceptLoop)
-                while (reader.readLine()?.isNotEmpty() == true) {}
-
                 val out = socket.getOutputStream()
                 out.write(
                     ("HTTP/1.1 200 OK\r\n" +

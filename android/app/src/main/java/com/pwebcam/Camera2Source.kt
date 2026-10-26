@@ -33,6 +33,8 @@ class Camera2Source(
     private var handler: Handler? = null
 
     private var maxTorchStrength: Int = 1
+    @Volatile private var quality = 80
+    private val pacer = FramePacer()
     private var aeCompRange: android.util.Range<Int> = android.util.Range(0, 0)
     private var currentFlashEnabled: Boolean = flashEnabled
     private var currentFlashBrightness: Int = flashBrightness
@@ -98,6 +100,7 @@ class Camera2Source(
             reader.setOnImageAvailableListener({ r ->
                 val image = r.acquireLatestImage() ?: return@setOnImageAvailableListener
                 try {
+                    if (!pacer.allow()) return@setOnImageAvailableListener
                     val bytes = if (useHardwareJpeg) imageToJpegDirect(image)
                                 else                 imageYuvToJpeg(image)
                     onFrame(bytes)
@@ -160,7 +163,7 @@ class Camera2Source(
             }
 
             if (useHardwareJpeg) {
-                set(CaptureRequest.JPEG_QUALITY, JPEG_QUALITY)
+                set(CaptureRequest.JPEG_QUALITY, quality.toByte())
             }
             if (currentFlashEnabled) {
                 set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
@@ -228,11 +231,13 @@ class Camera2Source(
 
         val yuv = YuvImage(nv21, ImageFormat.NV21, w, h, null)
         val out = ByteArrayOutputStream(nv21.size / 4)
-        yuv.compressToJpeg(Rect(0, 0, w, h), JPEG_QUALITY.toInt(), out)
+        yuv.compressToJpeg(Rect(0, 0, w, h), quality, out)
         return out.toByteArray()
     }
 
-    companion object {
-        private const val JPEG_QUALITY: Byte = 80
+    override fun setQuality(jpegQuality: Int, maxFps: Int) {
+        quality = jpegQuality.coerceIn(10, 100)
+        pacer.maxFps = maxFps.coerceIn(1, 30)
+        applyRepeatingRequest()   // hardware JPEG reads quality from the capture request
     }
 }

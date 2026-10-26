@@ -33,6 +33,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var seekFlashBrightness: SeekBar
     private lateinit var layoutCam2Jpeg: LinearLayout
     private lateinit var swCam2HwJpeg: Switch
+    private lateinit var swAutostart: Switch
 
     private val focusButtons get() = listOf(btnFocusPicture, btnFocusVideo, btnFocusFixed, btnFocusInfinity)
 
@@ -54,6 +55,10 @@ class MainActivity : AppCompatActivity() {
         seekFlashBrightness   = findViewById(R.id.seek_flash_brightness)
         layoutCam2Jpeg        = findViewById(R.id.layout_cam2_jpeg)
         swCam2HwJpeg          = findViewById(R.id.sw_cam2_hw_jpeg)
+
+        swAutostart           = findViewById(R.id.sw_autostart)
+        swAutostart.isChecked = CameraService.autostartEnabled(this)
+        swAutostart.setOnCheckedChangeListener { _, checked -> CameraService.setAutostart(this, checked) }
 
         btnToggle.setOnClickListener {
             if (CameraService.isRunning) stopStream() else requestCameraPermissionAndStart()

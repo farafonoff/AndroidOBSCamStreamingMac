@@ -14,6 +14,9 @@ class Camera1Source(
     private val flashEnabled: Boolean = false,
 ) : CameraSource {
 
+    @Volatile private var quality = 80
+    private val pacer = FramePacer()
+
     private var camera: Camera? = null
     private var surfaceTexture: SurfaceTexture? = null
 
@@ -50,10 +53,11 @@ class Camera1Source(
             }
 
             setPreviewCallback { data, cam ->
+                if (!pacer.allow()) return@setPreviewCallback
                 val sz = cam.parameters.previewSize
                 val yuv = YuvImage(data, ImageFormat.NV21, sz.width, sz.height, null)
                 val out = ByteArrayOutputStream(data.size / 4)
-                yuv.compressToJpeg(Rect(0, 0, sz.width, sz.height), JPEG_QUALITY, out)
+                yuv.compressToJpeg(Rect(0, 0, sz.width, sz.height), quality, out)
                 onFrame(out.toByteArray())
             }
 
@@ -62,6 +66,11 @@ class Camera1Source(
     }
 
     override fun apiName(): String = "Camera1"
+
+    override fun setQuality(jpegQuality: Int, maxFps: Int) {
+        quality = jpegQuality.coerceIn(10, 100)
+        pacer.maxFps = maxFps.coerceIn(1, 30)
+    }
 
     override fun configure(newEv: Int, newFocusAlias: String) {
         camera?.parameters = camera?.parameters?.apply {
@@ -95,8 +104,6 @@ class Camera1Source(
     }
 
     companion object {
-        private const val JPEG_QUALITY = 80
-
         private fun String.toCamera1FocusMode(): String = when (this) {
             "picture"  -> Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE
             "video"    -> Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO
