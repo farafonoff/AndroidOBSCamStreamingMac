@@ -29,9 +29,9 @@ if [[ -z "$PYTHON" ]]; then
 fi
 
 # Verify dependencies
-"$PYTHON" -c "import pyvirtualcam, PIL, numpy, requests" 2>/dev/null || {
+"$PYTHON" -c "import pyvirtualcam, PIL, numpy" 2>/dev/null || {
   echo "Installing Python dependencies..."
-  "$PYTHON" -m pip install pyvirtualcam pillow numpy requests --quiet
+  "$PYTHON" -m pip install pyvirtualcam pillow numpy --quiet
 }
 
 mkdir -p "$(dirname "$LOG")"

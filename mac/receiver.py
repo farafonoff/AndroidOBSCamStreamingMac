@@ -20,8 +20,10 @@ Watches the OBS camera extension's own log for two specific events:
 These are the ground-truth signals emitted by CoreMediaIO itself.
 """
 
+import http.client
 import io
 import logging
+import os
 import queue
 import re
 import signal
@@ -31,10 +33,10 @@ import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import numpy as np
 import pyvirtualcam
-import requests
 from PIL import Image
 
 
@@ -101,6 +103,9 @@ if TRANSPORT not in ("usb", "wifi", "auto"):
 PHONE_HOST = _cfg.get("PHONE_HOST", "").strip()
 MDNS_TYPE  = "_pwebcam._tcp"
 
+# DEBUG_TIMING=1 logs, once a second, frame rate, worst inter-frame gap and decode/send cost.
+DEBUG_TIMING = _cfg.get("DEBUG_TIMING", os.environ.get("DEBUG_TIMING", "")).strip().lower() in ("1", "true", "yes")
+
 # Camera settings (EV, focus) are stored on the phone and controlled via the
 # app UI. The receiver connects with a plain URL — no params needed.
 
@@ -109,7 +114,12 @@ PHONE_PORT_CAM2 = 8081
 PHONE_PACKAGE   = "com.pwebcam"
 PHONE_SERVICE   = "com.pwebcam/.CameraService"
 WIDTH, HEIGHT = 1280, 720
-FPS           = 30
+# Virtual camera output rate (FPS= in .env). The phone still sends ~30 fps; a higher value just
+# makes the extension re-serve the latest frame sooner, shrinking sampling jitter.
+try:
+    FPS = max(1, min(120, int(_cfg.get("FPS", "30"))))
+except ValueError:
+    FPS = 30
 # Seconds to wait after the last "remove client" before declaring camera closed.
 # Handles apps that briefly disconnect/reconnect (e.g. switching camera sources).
 CLOSE_DEBOUNCE = 2.0
@@ -310,45 +320,45 @@ def resolve_url() -> str | None:
 # ── MJPEG parser ─────────────────────────────────────────────────────────────
 
 def iter_mjpeg(url: str):
+    """
+    Yield JPEG frames from the phone's multipart stream.
+
+    Each part carries a Content-Length, so a frame is emitted the moment its last
+    byte arrives — we never wait for the *next* boundary (that would delay every
+    frame by one full frame interval) and never block on a fixed-size read.
+    """
+    u = urlsplit(url)
+    conn = http.client.HTTPConnection(u.hostname, u.port, timeout=5)
     try:
-        with requests.get(url, stream=True, timeout=5) as r:
-            r.raise_for_status()
-            ct = r.headers.get("Content-Type", "")
-            boundary = None
-            for part in ct.split(";"):
-                p = part.strip()
-                if p.startswith("boundary="):
-                    boundary = ("--" + p[len("boundary="):]).encode()
-                    break
-            if not boundary:
-                return
-            buf = b""
-            for chunk in r.iter_content(chunk_size=8192):
-                if not _running.is_set():
+        conn.request("GET", u.path or "/")
+        resp = conn.getresponse()
+        if resp.status != 200:
+            return
+        while _running.is_set():
+            line = resp.readline()
+            if not line:
+                return                      # connection closed
+            if not line.startswith(b"--"):
+                continue                    # blank line between parts
+            length = None
+            while True:
+                h = resp.readline()
+                if not h:
                     return
-                buf += chunk
-                while True:
-                    s = buf.find(boundary)
-                    if s == -1:
-                        buf = buf[-(len(boundary) - 1):]
-                        break
-                    e = buf.find(boundary, s + len(boundary))
-                    if e == -1:
-                        buf = buf[s:]
-                        break
-                    section = buf[s + len(boundary): e]
-                    he = section.find(b"\r\n\r\n")
-                    if he != -1:
-                        jpeg = section[he + 4:]
-                        if jpeg.endswith(b"\r\n"):
-                            jpeg = jpeg[:-2]
-                        if jpeg:
-                            yield jpeg
-                    buf = buf[e:]
-    except requests.exceptions.ConnectionError:
-        pass
-    except Exception as e:
+                if h in (b"\r\n", b"\n"):
+                    break
+                if h[:15].lower() == b"content-length:":
+                    length = int(h[15:])
+            if not length:
+                continue
+            jpeg = resp.read(length)
+            if len(jpeg) < length:
+                return
+            yield jpeg
+    except (OSError, http.client.HTTPException, ValueError) as e:
         log.debug("mjpeg: %s", e)
+    finally:
+        conn.close()
 
 
 def _reader(url: str, fq: queue.Queue, done: threading.Event) -> None:
@@ -438,6 +448,30 @@ def camera_monitor() -> None:
     proc.terminate()
 
 
+class _Timing:
+    """Once-a-second summary of frame cadence and per-frame cost (DEBUG_TIMING=1)."""
+
+    def __init__(self) -> None:
+        self.last = None
+        self.reset(time.perf_counter())
+
+    def reset(self, now: float) -> None:
+        self.start, self.n, self.gap, self.dec, self.snd = now, 0, 0.0, 0.0, 0.0
+
+    def add(self, t0: float, dec: float, snd: float) -> None:
+        if self.last is not None:
+            self.gap = max(self.gap, t0 - self.last)
+        self.last = t0
+        self.n += 1
+        self.dec += dec
+        self.snd += snd
+        if t0 - self.start >= 1.0:
+            n = self.n
+            log.info("timing: %.1f fps  max gap %.0f ms  decode %.1f ms  send %.1f ms",
+                     n / (t0 - self.start), self.gap * 1000, self.dec / n * 1000, self.snd / n * 1000)
+            self.reset(t0)
+
+
 # ── Phone streaming ───────────────────────────────────────────────────────────
 
 def phone_stream(cam: pyvirtualcam.Camera) -> None:
@@ -477,6 +511,7 @@ def phone_stream(cam: pyvirtualcam.Camera) -> None:
         t    = threading.Thread(target=_reader, args=(url, fq, done), daemon=True)
         t.start()
 
+        stats = _Timing() if DEBUG_TIMING else None
         streamed_this_session = False
         session_start = time.monotonic()
 
@@ -495,11 +530,20 @@ def phone_stream(cam: pyvirtualcam.Camera) -> None:
                     ever_streamed = True
 
                 try:
-                    frame = Image.open(io.BytesIO(jpeg)).convert("RGB")
-                    if frame.size != (WIDTH, HEIGHT):
-                        frame = frame.resize((WIDTH, HEIGHT), Image.BILINEAR)
-                    cam.send(np.asarray(frame))
-                    cam.sleep_until_next_frame()
+                    t0 = time.perf_counter()
+                    img = Image.open(io.BytesIO(jpeg))
+                    if img.mode != "RGB":
+                        img = img.convert("RGB")
+                    if img.size != (WIDTH, HEIGHT):
+                        img = img.resize((WIDTH, HEIGHT), Image.BILINEAR)
+                    frame = np.asarray(img)
+                    t1 = time.perf_counter()
+                    # Send immediately: the phone's own clock paces the stream. Sleeping
+                    # to a fixed grid here beats against that clock and adds judder.
+                    cam.send(frame)
+                    t2 = time.perf_counter()
+                    if stats is not None:
+                        stats.add(t0, t1 - t0, t2 - t1)
                 except Exception as e:
                     log.debug("frame decode: %s", e)
         finally:
