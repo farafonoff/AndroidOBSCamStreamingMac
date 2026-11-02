@@ -12,6 +12,7 @@ import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import org.json.JSONObject
 import java.util.concurrent.Executors
@@ -145,6 +146,9 @@ class CameraService : Service() {
     // Keeps the Wi-Fi radio out of power-save while serving; saves latency/jitter on old phones.
     private var wifiLock: WifiManager.WifiLock? = null
 
+    // Keeps the CPU running with the screen off so the servers keep answering.
+    private var cpuLock: PowerManager.WakeLock? = null
+
     private val nsdListeners = mutableListOf<NsdManager.RegistrationListener>()
 
     private val prefs by lazy { getSharedPreferences("pwebcam", Context.MODE_PRIVATE) }
@@ -205,6 +209,7 @@ class CameraService : Service() {
         try { server2.start() } catch (e: Exception) { e.printStackTrace() }
         registerNsd()
         acquireWifiLock()
+        acquireCpuLock()
         return START_STICKY
     }
 
@@ -258,6 +263,22 @@ class CameraService : Service() {
     private fun releaseWifiLock() {
         try { wifiLock?.takeIf { it.isHeld }?.release() } catch (_: Exception) {}
         wifiLock = null
+    }
+
+    private fun acquireCpuLock() {
+        if (cpuLock?.isHeld == true) return
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            cpuLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "pwebcam:server").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (e: Exception) { e.printStackTrace() }
+    }
+
+    private fun releaseCpuLock() {
+        try { cpuLock?.takeIf { it.isHeld }?.release() } catch (_: Exception) {}
+        cpuLock = null
     }
 
     private fun unregisterNsd() {
@@ -360,6 +381,7 @@ class CameraService : Service() {
         instance = null
         unregisterNsd()
         releaseWifiLock()
+        releaseCpuLock()
         server1.clientListener = null
         server2.clientListener = null
         server1.stop()
